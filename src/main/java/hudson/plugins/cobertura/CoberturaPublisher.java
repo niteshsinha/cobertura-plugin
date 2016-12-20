@@ -5,11 +5,11 @@ import hudson.FilePath;
 import hudson.Launcher;
 import hudson.Util;
 import hudson.model.Action;
-import hudson.model.BuildListener;
-import hudson.model.Result;
-import hudson.model.AbstractBuild;
 import hudson.model.AbstractItem;
 import hudson.model.AbstractProject;
+import hudson.model.Result;
+import hudson.model.Run;
+import hudson.model.TaskListener;
 import hudson.plugins.cobertura.renderers.SourceCodePainter;
 import hudson.plugins.cobertura.renderers.SourceEncoding;
 import hudson.plugins.cobertura.targets.CoverageMetric;
@@ -20,6 +20,8 @@ import hudson.tasks.BuildStepDescriptor;
 import hudson.tasks.BuildStepMonitor;
 import hudson.tasks.Publisher;
 import hudson.tasks.Recorder;
+import jenkins.SlaveToMasterFileCallable;
+import jenkins.tasks.SimpleBuildStep;
 
 import java.io.File;
 import java.io.FilenameFilter;
@@ -50,7 +52,7 @@ import org.kohsuke.stapler.StaplerRequest;
  *
  * @author Stephen Connolly
  */
-public class CoberturaPublisher extends Recorder {
+public class CoberturaPublisher extends Recorder implements SimpleBuildStep {
 
     private final String coberturaReportFile;
 
@@ -65,9 +67,9 @@ public class CoberturaPublisher extends Recorder {
     private final boolean autoUpdateStability;
 
     private final boolean zoomCoverageChart;
-    
+
     private final int maxNumberOfBuilds;
-    
+
     private boolean failNoReports = true;
 
     private CoverageTarget healthyTarget;
@@ -85,7 +87,7 @@ public class CoberturaPublisher extends Recorder {
      * @stapler-constructor
      */
     @DataBoundConstructor
-    public CoberturaPublisher(String coberturaReportFile, boolean onlyStable, boolean failUnhealthy, boolean failUnstable, 
+    public CoberturaPublisher(String coberturaReportFile, boolean onlyStable, boolean failUnhealthy, boolean failUnstable,
             boolean autoUpdateHealth, boolean autoUpdateStability, boolean zoomCoverageChart, boolean failNoReports, SourceEncoding sourceEncoding,
             int maxNumberOfBuilds) {
         this.coberturaReportFile = coberturaReportFile;
@@ -199,7 +201,7 @@ public class CoberturaPublisher extends Recorder {
     public boolean getOnlyStable() {
         return onlyStable;
     }
-    
+
     public int getMaxNumberOfBuilds() {
 		return maxNumberOfBuilds;
 	}
@@ -247,7 +249,7 @@ public class CoberturaPublisher extends Recorder {
     public boolean isFailNoReports() {
         return failNoReports;
     }
-    
+
     /**
      * Getter for property 'healthyTarget'.
      *
@@ -306,46 +308,39 @@ public class CoberturaPublisher extends Recorder {
      * Gets the directory where the Cobertura Report is stored for the given project.
      */
     /*package*/
-    static File getCoberturaReportDir(AbstractItem project) {
-        return new File(project.getRootDir(), "cobertura");
-    }
-
-    /**
-     * Gets the directory where the Cobertura Report is stored for the given project.
-     */
-    /*package*/
-    static File[] getCoberturaReports(AbstractBuild<?, ?> build) {
-        return build.getRootDir().listFiles(COBERTURA_FILENAME_FILTER);
+    static File[] getCoberturaReports(Run<?, ?> build) {
+        File rootDir = build.getRootDir();
+        return rootDir.listFiles(COBERTURA_FILENAME_FILTER);
     }
 
     /**
      * {@inheritDoc}
      */
     @Override
-    public boolean perform(AbstractBuild<?, ?> build, Launcher launcher, BuildListener listener) 
+    public void perform(Run<?, ?> build, FilePath workspace, Launcher launcher, final TaskListener listener)
             throws InterruptedException, IOException {
         Result threshold = onlyStable ? Result.SUCCESS : Result.UNSTABLE;
+        if (build.getResult() == null) {
+            listener.getLogger().println("Build had no result; build result must be set before running Cobertura publisher.");
+            return;
+        }
         if (build.getResult().isWorseThan(threshold)) {
             listener.getLogger().println("Skipping Cobertura coverage report as build was not " + threshold.toString() + " or better ...");
-            return true;
+            return;
         }
 
         listener.getLogger().println("[Cobertura] Publishing Cobertura coverage report...");
-        final FilePath[] moduleRoots = build.getModuleRoots();
-        final boolean multipleModuleRoots =
-                moduleRoots != null && moduleRoots.length > 1;
-        final FilePath moduleRoot = multipleModuleRoots ? build.getWorkspace() : build.getModuleRoot();
         final File buildCoberturaDir = build.getRootDir();
         FilePath buildTarget = new FilePath(buildCoberturaDir);
 
         FilePath[] reports = new FilePath[0];
         try {
-            reports = moduleRoot.act(new ParseReportCallable(coberturaReportFile));
+            reports = workspace.act(new ParseReportCallable(coberturaReportFile));
 
             // if the build has failed, then there's not
             // much point in reporting an error
             if (build.getResult().isWorseOrEqualTo(Result.FAILURE) && reports.length == 0) {
-                return true;
+                return;
             }
 
         } catch (IOException e) {
@@ -357,7 +352,7 @@ public class CoberturaPublisher extends Recorder {
         if (reports.length == 0) {
             String msg = "[Cobertura] No coverage results were found using the pattern '"
                     + coberturaReportFile + "' relative to '"
-                    + moduleRoot.getRemote() + "'."
+                    + workspace.getRemote() + "'."
                     + "  Did you enter a pattern relative to the correct directory?"
                     + "  Did you generate the XML report(s) for Cobertura?";
             listener.getLogger().println(msg);
@@ -366,7 +361,7 @@ public class CoberturaPublisher extends Recorder {
             } else {
                 listener.getLogger().println("[Cobertura] Skipped cobertura reports.");
             }
-            return true;
+            return;
         }
 
         for (int i = 0; i < reports.length; i++) {
@@ -395,7 +390,7 @@ public class CoberturaPublisher extends Recorder {
         if (result != null) {
             listener.getLogger().println("Cobertura coverage report found.");
             result.setOwner(build);
-            final FilePath paintedSourcesPath = new FilePath(new File(build.getProject().getRootDir(), "cobertura"));
+            final FilePath paintedSourcesPath = new FilePath(new File(build.getRootDir(), "cobertura"));
             paintedSourcesPath.mkdirs();
 
             if (sourcePaths.contains(".")) {
@@ -411,12 +406,13 @@ public class CoberturaPublisher extends Recorder {
             SourceCodePainter painter = new SourceCodePainter(paintedSourcesPath, sourcePaths,
                     result.getPaintedSources(), listener, getSourceEncoding());
 
-            moduleRoot.act(painter);
+            workspace.act(painter);
 
-            final CoberturaBuildAction action = CoberturaBuildAction.load(build, result, healthyTarget,
-                    unhealthyTarget, getOnlyStable(), getFailUnhealthy(), getFailUnstable(), getAutoUpdateHealth(), getAutoUpdateStability());
+            final CoberturaBuildAction action = CoberturaBuildAction.load(result, healthyTarget,
+                    unhealthyTarget, getOnlyStable(), getFailUnhealthy(), getFailUnstable(), getAutoUpdateHealth(), getAutoUpdateStability(),
+                    getZoomCoverageChart(), getMaxNumberOfBuilds());
 
-            build.getActions().add(action);
+            build.addAction(action);
             Set<CoverageMetric> failingMetrics = failingTarget.getFailingMetrics(result);
             if (!failingMetrics.isEmpty()) {
                 listener.getLogger().println("Code coverage enforcement failed for the following metrics:");
@@ -464,14 +460,12 @@ public class CoberturaPublisher extends Recorder {
                     + "the XML report(s) for Cobertura?");
             build.setResult(Result.FAILURE);
         }
-
-        return true;
     }
 
     /**
      * Changes unhealthy or unstable percentage fields for ratcheting.
      */
-    private void setNewPercentages(CoverageResult result, boolean select, BuildListener listener) {
+    private void setNewPercentages(CoverageResult result, boolean select, TaskListener listener) {
         Set<CoverageMetric> healthyMetrics = healthyTarget.getAllMetrics(result);
         float newPercent;
         float oldPercent;
@@ -502,14 +496,6 @@ public class CoberturaPublisher extends Recorder {
     /**
      * {@inheritDoc}
      */
-    @Override
-    public Action getProjectAction(AbstractProject<?, ?> project) {
-        return new CoberturaProjectAction(project, getOnlyStable());
-    }
-
-    /**
-     * {@inheritDoc}
-     */
     public BuildStepMonitor getRequiredMonitorService() {
         return BuildStepMonitor.NONE;
     }
@@ -533,7 +519,7 @@ public class CoberturaPublisher extends Recorder {
     @Extension
     public static final DescriptorImpl DESCRIPTOR = new DescriptorImpl();
 
-    public static class ParseReportCallable implements FilePath.FileCallable<FilePath[]> {
+    public static class ParseReportCallable extends SlaveToMasterFileCallable<FilePath[]> {
 
         private static final long serialVersionUID = 1L;
 
@@ -576,7 +562,7 @@ public class CoberturaPublisher extends Recorder {
                                 reader.close();
                             } catch (XMLStreamException ex) {
                                 //
-                            }                            
+                            }
                         }
                     } finally {
                         IOUtils.closeQuietly(is);
